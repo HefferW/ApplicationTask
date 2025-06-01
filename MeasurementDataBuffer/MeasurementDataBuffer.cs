@@ -1,9 +1,4 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+﻿using System.Collections.Concurrent;
 
 namespace MeasurementDataBuffer
 {
@@ -19,10 +14,13 @@ namespace MeasurementDataBuffer
         bool SaveMeasurementData(IMeasurementData measurement);
     }
 
-    internal class MeasurementDataBuffer
+    internal class MeasurementDataBuffer : IDisposable
     {
         private readonly IDao? _dao;
         private readonly BlockingCollection<IMeasurementData> _buffer;
+        private readonly CancellationTokenSource _cts;
+        private readonly Task _processingTask;
+        private bool _disposed = false;
 
         /// <summary>
         /// Constructor
@@ -32,6 +30,8 @@ namespace MeasurementDataBuffer
         {
             _dao = dao ?? throw new ArgumentNullException(nameof(dao));
             _buffer = new BlockingCollection<IMeasurementData>(new ConcurrentQueue<IMeasurementData>());
+            _cts = new CancellationTokenSource();
+            _processingTask = Task.Run((PersistBuffer));
         }
 
         /// <summary>
@@ -42,6 +42,7 @@ namespace MeasurementDataBuffer
         public void AddMeasurement(IMeasurementData measurement)
         {
             if (measurement == null) throw new ArgumentNullException(nameof(measurement));
+            if (_disposed) throw new ObjectDisposedException(nameof(MeasurementDataBuffer));
 
             _buffer.Add(measurement);
         }
@@ -54,6 +55,7 @@ namespace MeasurementDataBuffer
         public void AddMeasurements(List<IMeasurementData> measurements)
         {
             if (measurements == null) throw new ArgumentNullException(nameof(measurements));
+            if (_disposed) throw new ObjectDisposedException(nameof(MeasurementDataBuffer));
 
             foreach (var measurement in measurements)
             {
@@ -66,17 +68,63 @@ namespace MeasurementDataBuffer
         /// </summary>
         public void ClearBuffer()
         {
+            if (_disposed) throw new ObjectDisposedException(nameof(MeasurementDataBuffer));
+
             while (_buffer.TryTake(out _)) { }
         }
 
+        /// <summary>
+        /// Dispose ressources
+        /// </summary>
         public void Dispose()
         {
-            // ToDo: implement IDisposable interface
+            if (_disposed)
+                return;
+
+            _cts.Cancel(); // Signal cancellation
+            _buffer.CompleteAdding(); // Mark buffer as complete
+
+            try
+            {
+                _processingTask.Wait(); // Wait for background task to finish
+            }
+            catch (AggregateException ex) when (ex.InnerException is OperationCanceledException)
+            {
+                // Expected cancellation
+            }
+
+            _buffer.Dispose();
+            _cts.Dispose();
+            _disposed = true;
         }
 
+        /// <summary>
+        /// Write buffer to storage
+        /// </summary>
+        /// <returns>Task</returns>
         private async Task PersistBuffer()
         {
-            // ToDo: implement logic to move measurements to "storage"
+            try
+            {
+                foreach (var data in _buffer.GetConsumingEnumerable(_cts.Token))
+                {
+                    await Task.Run(() =>
+                    {
+                        try
+                        {
+                            _dao.SaveMeasurementData(data);
+                        }
+                        catch
+                        {
+                            // Optional: handle or log individual save failures
+                        }
+                    }, _cts.Token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Proper shutdown
+            }
         }
     }
 }
